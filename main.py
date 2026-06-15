@@ -15,7 +15,10 @@ from schemas import (
     AlertResponse, AlertItem, ErrorResponse,
     ExceptionTicketCreate, ExceptionTicketHandle,
     ExceptionTicketResponse, ExceptionTicketListResponse,
-    ExceptionTicketStats
+    ExceptionTicketStats, ExceptionTicketDetailResponse,
+    TagStatusInfo, ExceptionIssueRecordInfo, ExceptionCheckRecordInfo,
+    ExceptionProgressItem, ExceptionTicketDetailedStats,
+    ExceptionAreaStatsItem, ExceptionResponsibleStatsItem, ExceptionTypeStatsItem
 )
 from crud import (
     BusinessError, create_tag, get_tag, get_tag_by_code, list_tags,
@@ -24,7 +27,8 @@ from crud import (
     get_overtime_high_risk_areas, get_responsible_closure_rates,
     get_pending_check_stats, get_alerts, update_overtime_tags,
     create_exception_ticket, get_exception_ticket, list_exception_tickets,
-    handle_exception_ticket, get_exception_ticket_stats
+    handle_exception_ticket, get_exception_ticket_stats,
+    get_exception_ticket_detail, get_exception_ticket_detailed_stats
 )
 
 Base.metadata.create_all(bind=engine)
@@ -330,11 +334,30 @@ async def get_exception_tickets(
 
 
 @app.get("/api/exception-tickets/{ticket_id}", response_model=ExceptionTicketResponse, tags=["异常工单"])
-async def get_exception_ticket_detail(ticket_id: int, db: Session = Depends(get_db)):
+async def get_exception_ticket_basic(ticket_id: int, db: Session = Depends(get_db)):
     ticket = get_exception_ticket(db, ticket_id)
     if not ticket:
         raise HTTPException(status_code=404, detail=f"异常工单 ID {ticket_id} 不存在")
     return ticket
+
+
+@app.get("/api/exception-tickets/{ticket_id}/detail", response_model=ExceptionTicketDetailResponse, tags=["异常工单"])
+async def get_exception_ticket_full_detail(ticket_id: int, db: Session = Depends(get_db)):
+    detail = get_exception_ticket_detail(db, ticket_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"异常工单 ID {ticket_id} 不存在")
+
+    return ExceptionTicketDetailResponse(
+        ticket=ExceptionTicketResponse.model_validate(detail["ticket"]),
+        tag_status=TagStatusInfo.model_validate(detail["tag_status"]),
+        latest_issue_record=ExceptionIssueRecordInfo.model_validate(detail["latest_issue_record"]) if detail["latest_issue_record"] else None,
+        check_record=ExceptionCheckRecordInfo.model_validate(detail["check_record"]) if detail["check_record"] else None,
+        processing_progress=[
+            ExceptionProgressItem(**p) for p in detail["processing_progress"]
+        ],
+        current_responsible_person=detail["current_responsible_person"],
+        can_handle=detail["can_handle"]
+    )
 
 
 @app.put("/api/exception-tickets/{ticket_id}/handle", response_model=ExceptionTicketResponse, tags=["异常工单"])
@@ -344,6 +367,17 @@ async def handle_exception_ticket_by_id(
     db: Session = Depends(get_db)
 ):
     return handle_exception_ticket(db, ticket_id, handle_data)
+
+
+@app.get("/api/exception-statistics", response_model=ExceptionTicketDetailedStats, tags=["异常工单"])
+async def get_exception_detailed_stats(db: Session = Depends(get_db)):
+    stats = get_exception_ticket_detailed_stats(db)
+    return ExceptionTicketDetailedStats(
+        overview=stats["overview"],
+        by_area=[ExceptionAreaStatsItem(**a) for a in stats["by_area"]],
+        by_responsible=[ExceptionResponsibleStatsItem(**r) for r in stats["by_responsible"]],
+        by_exception_type=[ExceptionTypeStatsItem(**t) for t in stats["by_exception_type"]]
+    )
 
 
 @app.get("/api/status-options", tags=["系统"])

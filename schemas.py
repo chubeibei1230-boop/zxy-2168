@@ -214,6 +214,99 @@ class ExceptionTicketListResponse(BaseModel):
     page_size: int
 
 
+class TagStatusInfo(BaseModel):
+    id: int
+    tag_code: str
+    area: str
+    group_name: str
+    responsible_person: str
+    status: str
+    current_user: Optional[str] = None
+    issue_time: Optional[datetime] = None
+    expected_return_time: Optional[datetime] = None
+    retention_hours: int
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionIssueRecordInfo(BaseModel):
+    id: int
+    user_name: str
+    user_contact: Optional[str] = None
+    issue_time: datetime
+    expected_return_time: datetime
+    actual_return_time: Optional[datetime] = None
+    is_overtime: int
+    overtime_hours: int
+    status: str
+    return_note: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionCheckRecordInfo(BaseModel):
+    id: int
+    overtime_description: str
+    handling_conclusion: str
+    check_person: str
+    check_time: datetime
+    is_closed: int
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionProgressItem(BaseModel):
+    status: str
+    handler: Optional[str] = None
+    handling_conclusion: Optional[str] = None
+    handling_time: Optional[datetime] = None
+    timestamp: datetime
+
+
+class ExceptionTicketDetailResponse(BaseModel):
+    ticket: ExceptionTicketResponse
+    tag_status: TagStatusInfo
+    latest_issue_record: Optional[ExceptionIssueRecordInfo] = None
+    check_record: Optional[ExceptionCheckRecordInfo] = None
+    processing_progress: List[ExceptionProgressItem]
+    current_responsible_person: str
+    can_handle: bool
+
+
+class ExceptionAreaStatsItem(BaseModel):
+    area: str
+    total_count: int
+    pending_count: int
+    closed_count: int
+    closure_rate: float
+
+
+class ExceptionResponsibleStatsItem(BaseModel):
+    responsible_person: str
+    total_count: int
+    pending_count: int
+    closed_count: int
+    closure_rate: float
+
+
+class ExceptionTypeStatsItem(BaseModel):
+    exception_type: str
+    total_count: int
+    pending_count: int
+    closed_count: int
+    closure_rate: float
+
+
+class ExceptionTicketDetailedStats(BaseModel):
+    overview: dict
+    by_area: List[ExceptionAreaStatsItem]
+    by_responsible: List[ExceptionResponsibleStatsItem]
+    by_exception_type: List[ExceptionTypeStatsItem]
+
+
 class ExceptionTicketStats(BaseModel):
     pending_count: int
     closed_count: int

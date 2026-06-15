@@ -90,35 +90,6 @@ def _check_manual_restore_allowed(tag: LuggageTag):
         )
 
 
-def update_overtime_tags(db: Session):
-    now = datetime.utcnow()
-    overtime_tags = db.query(LuggageTag).filter(
-        and_(
-            LuggageTag.status == TagStatus.IN_USE,
-            LuggageTag.expected_return_time < now
-        )
-    ).all()
-
-    for tag in overtime_tags:
-        tag.status = TagStatus.OVERTIME
-        tag.updated_at = now
-
-        latest_record = db.query(TagIssueRecord).filter(
-            and_(
-                TagIssueRecord.tag_id == tag.id,
-                TagIssueRecord.status == "使用中"
-            )
-        ).order_by(TagIssueRecord.id.desc()).first()
-
-        if latest_record:
-            latest_record.is_overtime = 1
-            overtime_delta = now - tag.expected_return_time
-            latest_record.overtime_hours = int(overtime_delta.total_seconds() / 3600) + 1
-
-    db.commit()
-    return len(overtime_tags)
-
-
 def create_tag(db: Session, tag: TagCreate) -> LuggageTag:
     existing = db.query(LuggageTag).filter(LuggageTag.tag_code == tag.tag_code).first()
     if existing:
@@ -1059,3 +1030,217 @@ def get_exception_ticket_stats(db: Session) -> dict:
         "by_responsible": by_responsible,
         "by_area": by_area
     }
+
+
+def get_exception_ticket_detail(db: Session, ticket_id: int) -> Optional[dict]:
+    ticket = get_exception_ticket(db, ticket_id)
+    if not ticket:
+        return None
+
+    tag = db.query(LuggageTag).filter(LuggageTag.id == ticket.tag_id).first()
+    if not tag:
+        raise BusinessError(f"寄物牌 ID {ticket.tag_id} 不存在", code=404)
+
+    latest_issue_record = None
+    if ticket.issue_record_id:
+        latest_issue_record = db.query(TagIssueRecord).filter(
+            TagIssueRecord.id == ticket.issue_record_id
+        ).first()
+
+    if not latest_issue_record:
+        latest_issue_record = db.query(TagIssueRecord).filter(
+            TagIssueRecord.tag_id == tag.id
+        ).order_by(TagIssueRecord.id.desc()).first()
+
+    check_record = None
+    if latest_issue_record:
+        check_record = db.query(TagCheckRecord).filter(
+            TagCheckRecord.issue_record_id == latest_issue_record.id
+        ).first()
+
+    processing_progress = []
+    processing_progress.append({
+        "status": TicketStatus.PENDING.value,
+        "handler": None,
+        "handling_conclusion": None,
+        "handling_time": None,
+        "timestamp": ticket.created_at
+    })
+
+    if ticket.ticket_status in [TicketStatus.PROCESSING, TicketStatus.CLOSED]:
+        processing_progress.append({
+            "status": TicketStatus.PROCESSING.value,
+            "handler": ticket.handler,
+            "handling_conclusion": ticket.handling_conclusion,
+            "handling_time": ticket.handling_time,
+            "timestamp": ticket.handling_time if ticket.handling_time else ticket.updated_at
+        })
+
+    if ticket.ticket_status == TicketStatus.CLOSED:
+        processing_progress.append({
+            "status": TicketStatus.CLOSED.value,
+            "handler": ticket.handler,
+            "handling_conclusion": ticket.handling_conclusion,
+            "handling_time": ticket.handling_time,
+            "timestamp": ticket.handling_time if ticket.handling_time else ticket.updated_at
+        })
+
+    can_handle = ticket.ticket_status != TicketStatus.CLOSED
+
+    return {
+        "ticket": ticket,
+        "tag_status": tag,
+        "latest_issue_record": latest_issue_record,
+        "check_record": check_record,
+        "processing_progress": processing_progress,
+        "current_responsible_person": tag.responsible_person,
+        "can_handle": can_handle
+    }
+
+
+def get_exception_ticket_detailed_stats(db: Session) -> dict:
+    total_count = db.query(TagExceptionTicket).count()
+    pending_count = db.query(TagExceptionTicket).filter(
+        TagExceptionTicket.ticket_status == TicketStatus.PENDING
+    ).count()
+    processing_count = db.query(TagExceptionTicket).filter(
+        TagExceptionTicket.ticket_status == TicketStatus.PROCESSING
+    ).count()
+    closed_count = db.query(TagExceptionTicket).filter(
+        TagExceptionTicket.ticket_status == TicketStatus.CLOSED
+    ).count()
+
+    total_pending = pending_count + processing_count
+    closure_rate = round(closed_count / total_count * 100, 2) if total_count > 0 else 0.0
+
+    overview = {
+        "total_count": total_count,
+        "pending_count": pending_count,
+        "processing_count": processing_count,
+        "total_pending": total_pending,
+        "closed_count": closed_count,
+        "closure_rate": closure_rate
+    }
+
+    by_area_records = db.query(
+        TagExceptionTicket.area,
+        func.count(TagExceptionTicket.id).label("total_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 0),
+            else_=1
+        )).label("pending_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 1),
+            else_=0
+        )).label("closed_count")
+    ).group_by(TagExceptionTicket.area).all()
+
+    by_area = []
+    for area, total, pending, closed in by_area_records:
+        closed_int = int(closed or 0)
+        total_int = int(total or 0)
+        rate = round(closed_int / total_int * 100, 2) if total_int > 0 else 0.0
+        by_area.append({
+            "area": area,
+            "total_count": total_int,
+            "pending_count": int(pending or 0),
+            "closed_count": closed_int,
+            "closure_rate": rate
+        })
+    by_area.sort(key=lambda x: x["total_count"], reverse=True)
+
+    by_responsible_records = db.query(
+        TagExceptionTicket.responsible_person,
+        func.count(TagExceptionTicket.id).label("total_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 0),
+            else_=1
+        )).label("pending_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 1),
+            else_=0
+        )).label("closed_count")
+    ).group_by(TagExceptionTicket.responsible_person).all()
+
+    by_responsible = []
+    for person, total, pending, closed in by_responsible_records:
+        closed_int = int(closed or 0)
+        total_int = int(total or 0)
+        rate = round(closed_int / total_int * 100, 2) if total_int > 0 else 0.0
+        by_responsible.append({
+            "responsible_person": person,
+            "total_count": total_int,
+            "pending_count": int(pending or 0),
+            "closed_count": closed_int,
+            "closure_rate": rate
+        })
+    by_responsible.sort(key=lambda x: x["pending_count"], reverse=True)
+
+    by_type_records = db.query(
+        TagExceptionTicket.exception_type,
+        func.count(TagExceptionTicket.id).label("total_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 0),
+            else_=1
+        )).label("pending_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 1),
+            else_=0
+        )).label("closed_count")
+    ).group_by(TagExceptionTicket.exception_type).all()
+
+    by_exception_type = []
+    for ex_type, total, pending, closed in by_type_records:
+        closed_int = int(closed or 0)
+        total_int = int(total or 0)
+        rate = round(closed_int / total_int * 100, 2) if total_int > 0 else 0.0
+        by_exception_type.append({
+            "exception_type": ex_type.value if isinstance(ex_type, ExceptionType) else str(ex_type),
+            "total_count": total_int,
+            "pending_count": int(pending or 0),
+            "closed_count": closed_int,
+            "closure_rate": rate
+        })
+    by_exception_type.sort(key=lambda x: x["total_count"], reverse=True)
+
+    return {
+        "overview": overview,
+        "by_area": by_area,
+        "by_responsible": by_responsible,
+        "by_exception_type": by_exception_type
+    }
+
+
+def update_overtime_tags(db: Session):
+    now = datetime.utcnow()
+    overtime_tags = db.query(LuggageTag).filter(
+        and_(
+            LuggageTag.status == TagStatus.IN_USE,
+            LuggageTag.expected_return_time < now
+        )
+    ).all()
+
+    for tag in overtime_tags:
+        tag.status = TagStatus.OVERTIME
+        tag.updated_at = now
+
+        latest_record = db.query(TagIssueRecord).filter(
+            and_(
+                TagIssueRecord.tag_id == tag.id,
+                TagIssueRecord.status == "使用中"
+            )
+        ).order_by(TagIssueRecord.id.desc()).first()
+
+        if latest_record:
+            latest_record.is_overtime = 1
+            overtime_delta = now - tag.expected_return_time
+            latest_record.overtime_hours = int(overtime_delta.total_seconds() / 3600) + 1
+
+            _auto_create_exception_ticket(
+                db, tag, latest_record,
+                ExceptionType.OVERTIME,
+                f"寄物牌超时{latest_record.overtime_hours}小时未归还"
+            )
+
+    db.commit()
+    return len(overtime_tags)
