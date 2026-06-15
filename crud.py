@@ -418,6 +418,17 @@ def check_tag(db: Session, tag_code: str, check_data: CheckRecordCreate) -> Tupl
     if not latest_record:
         raise BusinessError(f"寄物牌 {tag_code} 没有待核对的发放记录", code=404)
 
+    existing_check = db.query(TagCheckRecord).filter(
+        TagCheckRecord.issue_record_id == latest_record.id
+    ).first()
+    if existing_check:
+        raise BusinessError(
+            f"发放记录 ID {latest_record.id} 已完成核对，不能重复核对",
+            conflict_object=f"发放记录#{latest_record.id}",
+            current_status="已核对",
+            code=409
+        )
+
     check_record = TagCheckRecord(
         tag_id=tag.id,
         issue_record_id=latest_record.id,
@@ -587,38 +598,43 @@ def get_alerts(db: Session) -> List[dict]:
     alerts = []
     now = datetime.utcnow()
 
-    consecutive_overtime_tags = db.query(
-        LuggageTag.responsible_person,
-        LuggageTag.tag_code,
-        func.count(TagIssueRecord.id).label("overtime_count")
-    ).join(
-        TagIssueRecord, LuggageTag.id == TagIssueRecord.tag_id
-    ).filter(
-        TagIssueRecord.is_overtime == 1
-    ).group_by(
-        LuggageTag.id
-    ).having(
-        func.count(TagIssueRecord.id) >= 3
-    ).all()
+    all_tags = db.query(LuggageTag).all()
+    for tag in all_tags:
+        records = db.query(TagIssueRecord).filter(
+            TagIssueRecord.tag_id == tag.id
+        ).order_by(TagIssueRecord.id.desc()).all()
 
-    for person, tag_code, count in consecutive_overtime_tags:
-        alerts.append({
-            "alert_type": "连续超时占用",
-            "alert_level": "高",
-            "target": tag_code,
-            "message": f"寄物牌 {tag_code} 已连续 {count} 次超时占用",
-            "details": {
-                "tag_code": tag_code,
-                "responsible_person": person,
-                "overtime_count": count
-            }
-        })
+        consecutive_count = 0
+        for rec in records:
+            if rec.is_overtime == 1:
+                consecutive_count += 1
+            else:
+                break
+
+        if consecutive_count >= 3:
+            alerts.append({
+                "alert_type": "连续超时占用",
+                "alert_level": "高",
+                "target": tag.tag_code,
+                "message": f"寄物牌 {tag.tag_code} 已连续 {consecutive_count} 次超时占用",
+                "details": {
+                    "tag_code": tag.tag_code,
+                    "responsible_person": tag.responsible_person,
+                    "overtime_count": consecutive_count
+                }
+            })
 
     group_stats = db.query(
         LuggageTag.group_name,
         LuggageTag.area,
         func.count(LuggageTag.id).label("total_tags"),
-        func.sum(case((LuggageTag.status == TagStatus.IN_USE, 1), else_=0)).label("in_use_count")
+        func.sum(case(
+            (or_(
+                LuggageTag.status == TagStatus.IN_USE,
+                LuggageTag.status == TagStatus.OVERTIME
+            ), 1),
+            else_=0
+        )).label("in_use_count")
     ).group_by(LuggageTag.group_name, LuggageTag.area).all()
 
     for group_name, area, total_tags, in_use_count in group_stats:
@@ -661,25 +677,48 @@ def get_alerts(db: Session) -> List[dict]:
                 }
             })
 
-    disabled_issue_records = db.query(TagIssueRecord).join(
-        LuggageTag, TagIssueRecord.tag_id == LuggageTag.id
-    ).filter(
+    disabled_tags = db.query(LuggageTag).filter(
         LuggageTag.status == TagStatus.DISABLED
-    ).filter(
-        TagIssueRecord.issue_time > now - timedelta(days=7)
     ).all()
 
-    for record in disabled_issue_records:
-        alerts.append({
-            "alert_type": "停用后误发放",
-            "alert_level": "高",
-            "target": record.tag_code,
-            "message": f"寄物牌 {record.tag_code} 已停用但近期仍有发放记录",
-            "details": {
-                "tag_code": record.tag_code,
-                "issue_time": record.issue_time.isoformat() if record.issue_time else None,
-                "user_name": record.user_name
-            }
-        })
+    for tag in disabled_tags:
+        all_records = db.query(TagIssueRecord).filter(
+            TagIssueRecord.tag_id == tag.id
+        ).order_by(TagIssueRecord.id.desc()).all()
+
+        if not all_records:
+            continue
+
+        last_return_time = None
+        for rec in all_records:
+            if rec.actual_return_time:
+                last_return_time = rec.actual_return_time
+                break
+
+        for record in all_records:
+            in_7days = record.issue_time > now - timedelta(days=7)
+            if not in_7days:
+                continue
+
+            issued_after_last_return = (
+                last_return_time is None
+                or record.issue_time > last_return_time
+            )
+
+            is_active_issue = record.actual_return_time is None
+
+            if issued_after_last_return or is_active_issue:
+                alerts.append({
+                    "alert_type": "停用后误发放",
+                    "alert_level": "高",
+                    "target": record.tag_code,
+                    "message": f"寄物牌 {record.tag_code} 已停用但近期仍有发放记录",
+                    "details": {
+                        "tag_code": record.tag_code,
+                        "issue_time": record.issue_time.isoformat() if record.issue_time else None,
+                        "user_name": record.user_name
+                    }
+                })
+                break
 
     return alerts
