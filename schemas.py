@@ -183,6 +183,7 @@ class ExceptionTicketHandle(BaseModel):
     handling_conclusion: str = Field(..., description="处理结论")
     handler: str = Field(..., max_length=100, description="处理人")
     ticket_status: Optional[str] = Field("已闭环", description="处理状态：待处理/处理中/已闭环")
+    handling_time: Optional[datetime] = Field(None, description="实际处理时间，不传则使用服务器当前时间")
 
 
 class ExceptionTicketResponse(BaseModel):

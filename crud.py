@@ -366,11 +366,27 @@ def return_tag(db: Session, tag_code: str, request: ReturnTagRequest) -> Tuple[L
 
     if is_overtime:
         tag.status = TagStatus.PENDING_CHECK
-        _auto_create_exception_ticket(
-            db, tag, latest_record,
-            ExceptionType.OVERTIME,
-            f"寄物牌超时{overtime_hours}小时归还"
-        )
+        if latest_record:
+            existing_closed = db.query(TagExceptionTicket).filter(
+                and_(
+                    TagExceptionTicket.issue_record_id == latest_record.id,
+                    TagExceptionTicket.ticket_status == TicketStatus.CLOSED
+                )
+            ).first()
+            if existing_closed:
+                pass
+            else:
+                _auto_create_exception_ticket(
+                    db, tag, latest_record,
+                    ExceptionType.OVERTIME,
+                    f"寄物牌超时{overtime_hours}小时归还"
+                )
+        else:
+            _auto_create_exception_ticket(
+                db, tag, latest_record,
+                ExceptionType.OVERTIME,
+                f"寄物牌超时{overtime_hours}小时归还"
+            )
     else:
         tag.status = TagStatus.AVAILABLE
 
@@ -954,15 +970,17 @@ def handle_exception_ticket(
         )
 
     now = datetime.utcnow()
+    actual_handling_time = handle_data.handling_time if handle_data.handling_time else now
+
     ticket.handling_conclusion = handle_data.handling_conclusion
     ticket.handler = handle_data.handler
-    ticket.handling_time = now
+    ticket.handling_time = actual_handling_time
     ticket.ticket_status = target_status
     ticket.updated_at = now
 
     if target_status == TicketStatus.CLOSED:
         tag = db.query(LuggageTag).filter(LuggageTag.id == ticket.tag_id).first()
-        if tag and tag.status == TagStatus.PENDING_CHECK:
+        if tag:
             other_unclosed = db.query(TagExceptionTicket).filter(
                 and_(
                     TagExceptionTicket.tag_id == tag.id,
@@ -970,9 +988,16 @@ def handle_exception_ticket(
                     TagExceptionTicket.ticket_status != TicketStatus.CLOSED
                 )
             ).first()
+
             if not other_unclosed:
-                tag.status = TagStatus.AVAILABLE
-                tag.updated_at = now
+                if ticket.exception_type == ExceptionType.MANUAL_MARK:
+                    if tag.status in [TagStatus.PENDING_CHECK, TagStatus.OVERTIME, TagStatus.AVAILABLE, TagStatus.PENDING_ISSUE]:
+                        tag.status = TagStatus.AVAILABLE
+                        tag.updated_at = now
+                elif ticket.exception_type in [ExceptionType.OVERTIME, ExceptionType.PENDING_CHECK]:
+                    if tag.status == TagStatus.OVERTIME:
+                        tag.status = TagStatus.PENDING_CHECK
+                        tag.updated_at = now
 
     db.commit()
     db.refresh(ticket)
