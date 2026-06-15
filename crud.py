@@ -839,18 +839,56 @@ def create_exception_ticket(
             code=400
         )
 
-    latest_record = db.query(TagIssueRecord).filter(
+    has_any_record = db.query(TagIssueRecord).filter(
         TagIssueRecord.tag_id == tag.id
-    ).order_by(TagIssueRecord.id.desc()).first()
+    ).first()
+    if not has_any_record:
+        raise BusinessError(
+            f"寄物牌 {ticket_data.tag_code} 从未发放过，无法创建异常工单",
+            conflict_object=tag.tag_code,
+            current_status=tag.status.value,
+            code=400
+        )
+
+    existing_unclosed = db.query(TagExceptionTicket).filter(
+        and_(
+            TagExceptionTicket.tag_id == tag.id,
+            TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+        )
+    ).first()
+    if existing_unclosed:
+        raise BusinessError(
+            f"寄物牌 {ticket_data.tag_code} 已存在未闭环异常工单（工单号#{existing_unclosed.id}），不能重复创建",
+            conflict_object=f"异常工单#{existing_unclosed.id}",
+            current_status=existing_unclosed.ticket_status.value,
+            code=409
+        )
+
+    active_record = None
+    if tag.status in [TagStatus.IN_USE, TagStatus.OVERTIME]:
+        active_record = db.query(TagIssueRecord).filter(
+            and_(
+                TagIssueRecord.tag_id == tag.id,
+                TagIssueRecord.status == "使用中"
+            )
+        ).order_by(TagIssueRecord.id.desc()).first()
+    elif tag.status == TagStatus.PENDING_CHECK:
+        active_record = db.query(TagIssueRecord).filter(
+            and_(
+                TagIssueRecord.tag_id == tag.id,
+                TagIssueRecord.status == "已归还",
+                TagIssueRecord.is_overtime == 1
+            )
+        ).order_by(TagIssueRecord.id.desc()).first()
 
     ticket = TagExceptionTicket(
         tag_id=tag.id,
-        issue_record_id=latest_record.id if latest_record else None,
+        issue_record_id=active_record.id if active_record else None,
         tag_code=tag.tag_code,
         area=tag.area,
         group_name=tag.group_name,
         responsible_person=tag.responsible_person,
-        user_name=latest_record.user_name if latest_record else tag.current_user,
+        user_name=active_record.user_name if active_record else None,
         exception_type=ex_type,
         exception_description=ticket_data.exception_description,
         ticket_status=TicketStatus.PENDING
@@ -893,13 +931,21 @@ def list_exception_tickets(
             et = ExceptionType(exception_type)
             query = query.filter(TagExceptionTicket.exception_type == et)
         except ValueError:
-            pass
+            raise BusinessError(
+                f"无效的异常类型筛选值: {exception_type}",
+                conflict_object=exception_type,
+                code=400
+            )
     if ticket_status:
         try:
             ts = TicketStatus(ticket_status)
             query = query.filter(TagExceptionTicket.ticket_status == ts)
         except ValueError:
-            pass
+            raise BusinessError(
+                f"无效的处理状态筛选值: {ticket_status}",
+                conflict_object=ticket_status,
+                code=400
+            )
     if start_date:
         query = query.filter(TagExceptionTicket.created_at >= start_date)
     if end_date:
