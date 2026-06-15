@@ -18,7 +18,8 @@ from schemas import (
     ExceptionTicketStats, ExceptionTicketDetailResponse,
     TagStatusInfo, ExceptionIssueRecordInfo, ExceptionCheckRecordInfo,
     ExceptionProgressItem, ExceptionTicketDetailedStats,
-    ExceptionAreaStatsItem, ExceptionResponsibleStatsItem, ExceptionTypeStatsItem
+    ExceptionAreaStatsItem, ExceptionResponsibleStatsItem, ExceptionTypeStatsItem,
+    ExceptionLedgerItem, ExceptionLedgerListResponse
 )
 from crud import (
     BusinessError, create_tag, get_tag, get_tag_by_code, list_tags,
@@ -28,7 +29,8 @@ from crud import (
     get_pending_check_stats, get_alerts, update_overtime_tags,
     create_exception_ticket, get_exception_ticket, list_exception_tickets,
     handle_exception_ticket, get_exception_ticket_stats,
-    get_exception_ticket_detail, get_exception_ticket_detailed_stats
+    get_exception_ticket_detail, get_exception_ticket_detailed_stats,
+    list_exception_ledgers
 )
 
 Base.metadata.create_all(bind=engine)
@@ -369,7 +371,36 @@ async def handle_exception_ticket_by_id(
     return handle_exception_ticket(db, ticket_id, handle_data)
 
 
-@app.get("/api/exception-statistics", response_model=ExceptionTicketDetailedStats, tags=["异常工单"])
+@app.get("/api/exception-ledgers", response_model=ExceptionLedgerListResponse, tags=["异常台账"])
+async def get_exception_ledgers(
+    tag_code: Optional[str] = Query(None, description="寄物牌编号"),
+    area: Optional[str] = Query(None, description="所属区域"),
+    group_name: Optional[str] = Query(None, description="分组"),
+    responsible_person: Optional[str] = Query(None, description="责任人"),
+    exception_type: Optional[str] = Query(None, description="异常类型：超时归还/待核对/人工标记异常"),
+    ticket_status: Optional[str] = Query(None, description="处理状态：待处理/处理中/已闭环"),
+    start_date: Optional[datetime] = Query(None, description="发生开始日期"),
+    end_date: Optional[datetime] = Query(None, description="发生结束日期"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    db: Session = Depends(get_db)
+):
+    skip = (page - 1) * page_size
+    items, total = list_exception_ledgers(
+        db, tag_code=tag_code, area=area, group_name=group_name,
+        responsible_person=responsible_person, exception_type=exception_type,
+        ticket_status=ticket_status, start_date=start_date, end_date=end_date,
+        skip=skip, limit=page_size
+    )
+    return ExceptionLedgerListResponse(
+        items=[ExceptionLedgerItem(**item) for item in items],
+        total=total,
+        page=page,
+        page_size=page_size
+    )
+
+
+@app.get("/api/exception-statistics", response_model=ExceptionTicketDetailedStats, tags=["异常台账"])
 async def get_exception_detailed_stats(db: Session = Depends(get_db)):
     stats = get_exception_ticket_detailed_stats(db)
     return ExceptionTicketDetailedStats(

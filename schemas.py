@@ -281,6 +281,7 @@ class ExceptionAreaStatsItem(BaseModel):
     area: str
     total_count: int
     pending_count: int
+    processing_count: int
     closed_count: int
     closure_rate: float
 
@@ -289,6 +290,7 @@ class ExceptionResponsibleStatsItem(BaseModel):
     responsible_person: str
     total_count: int
     pending_count: int
+    processing_count: int
     closed_count: int
     closure_rate: float
 
@@ -297,6 +299,7 @@ class ExceptionTypeStatsItem(BaseModel):
     exception_type: str
     total_count: int
     pending_count: int
+    processing_count: int
     closed_count: int
     closure_rate: float
 
@@ -313,6 +316,39 @@ class ExceptionTicketStats(BaseModel):
     closed_count: int
     by_responsible: List[dict]
     by_area: List[dict]
+
+
+class ExceptionLedgerItem(BaseModel):
+    id: int
+    tag_id: int
+    tag_code: str
+    area: str
+    group_name: str
+    responsible_person: str
+    user_name: Optional[str] = None
+    exception_type: str
+    exception_description: Optional[str] = None
+    handling_conclusion: Optional[str] = None
+    handler: Optional[str] = None
+    handling_time: Optional[datetime] = None
+    ticket_status: str
+    created_at: datetime
+    updated_at: datetime
+    tag_current_status: str
+    latest_issue_time: Optional[datetime] = None
+    latest_expected_return_time: Optional[datetime] = None
+    latest_user_name: Optional[str] = None
+    exception_source: str
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionLedgerListResponse(BaseModel):
+    items: List[ExceptionLedgerItem]
+    total: int
+    page: int
+    page_size: int
 
 
 class StatisticsResponse(BaseModel):

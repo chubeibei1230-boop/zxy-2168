@@ -943,6 +943,84 @@ def list_exception_tickets(
     return items, total
 
 
+def _get_exception_source(ticket: TagExceptionTicket, has_check_record: bool) -> str:
+    if ticket.exception_type == ExceptionType.MANUAL_MARK:
+        return "人工登记"
+    elif ticket.exception_type == ExceptionType.OVERTIME:
+        if has_check_record:
+            return "归还超时(自动生成)"
+        else:
+            return "占用超时(自动生成)"
+    elif ticket.exception_type == ExceptionType.PENDING_CHECK:
+        return "核对未闭环(自动生成)"
+    return "系统生成"
+
+
+def list_exception_ledgers(
+    db: Session,
+    tag_code: Optional[str] = None,
+    area: Optional[str] = None,
+    group_name: Optional[str] = None,
+    responsible_person: Optional[str] = None,
+    exception_type: Optional[str] = None,
+    ticket_status: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> Tuple[List[dict], int]:
+    update_overtime_tags(db)
+
+    tickets, total = list_exception_tickets(
+        db, tag_code=tag_code, area=area, group_name=group_name,
+        responsible_person=responsible_person, exception_type=exception_type,
+        ticket_status=ticket_status, start_date=start_date, end_date=end_date,
+        skip=skip, limit=limit
+    )
+
+    ledger_items = []
+    for ticket in tickets:
+        tag = db.query(LuggageTag).filter(LuggageTag.id == ticket.tag_id).first()
+
+        latest_issue = db.query(TagIssueRecord).filter(
+            TagIssueRecord.tag_id == ticket.tag_id
+        ).order_by(TagIssueRecord.id.desc()).first()
+
+        has_check = False
+        if ticket.issue_record_id:
+            check_record = db.query(TagCheckRecord).filter(
+                TagCheckRecord.issue_record_id == ticket.issue_record_id
+            ).first()
+            has_check = check_record is not None
+
+        exception_source = _get_exception_source(ticket, has_check)
+
+        ledger_items.append({
+            "id": ticket.id,
+            "tag_id": ticket.tag_id,
+            "tag_code": ticket.tag_code,
+            "area": ticket.area,
+            "group_name": ticket.group_name,
+            "responsible_person": ticket.responsible_person,
+            "user_name": ticket.user_name,
+            "exception_type": ticket.exception_type.value if isinstance(ticket.exception_type, ExceptionType) else str(ticket.exception_type),
+            "exception_description": ticket.exception_description,
+            "handling_conclusion": ticket.handling_conclusion,
+            "handler": ticket.handler,
+            "handling_time": ticket.handling_time,
+            "ticket_status": ticket.ticket_status.value if isinstance(ticket.ticket_status, TicketStatus) else str(ticket.ticket_status),
+            "created_at": ticket.created_at,
+            "updated_at": ticket.updated_at,
+            "tag_current_status": tag.status.value if tag and isinstance(tag.status, TagStatus) else str(tag.status) if tag else "未知",
+            "latest_issue_time": latest_issue.issue_time if latest_issue else None,
+            "latest_expected_return_time": latest_issue.expected_return_time if latest_issue else None,
+            "latest_user_name": latest_issue.user_name if latest_issue else None,
+            "exception_source": exception_source
+        })
+
+    return ledger_items, total
+
+
 def handle_exception_ticket(
     db: Session,
     ticket_id: int,
@@ -972,6 +1050,43 @@ def handle_exception_ticket(
     now = datetime.utcnow()
     actual_handling_time = handle_data.handling_time if handle_data.handling_time else now
 
+    if target_status == TicketStatus.CLOSED:
+        tag = db.query(LuggageTag).filter(LuggageTag.id == ticket.tag_id).first()
+        issue_record = None
+        if ticket.issue_record_id:
+            issue_record = db.query(TagIssueRecord).filter(
+                TagIssueRecord.id == ticket.issue_record_id
+            ).first()
+
+        if ticket.exception_type in [ExceptionType.OVERTIME, ExceptionType.PENDING_CHECK]:
+            if tag and tag.status == TagStatus.OVERTIME:
+                raise BusinessError(
+                    f"寄物牌 {tag.tag_code} 超时未归还，不能直接闭环异常工单",
+                    conflict_object=f"异常工单#{ticket_id}",
+                    current_status=tag.status.value,
+                    code=409
+                )
+            if issue_record and issue_record.actual_return_time is None:
+                raise BusinessError(
+                    f"寄物牌 {ticket.tag_code} 尚未归还，不能直接闭环异常工单",
+                    conflict_object=f"异常工单#{ticket_id}",
+                    current_status="未归还",
+                    code=409
+                )
+            if tag and tag.status == TagStatus.PENDING_CHECK:
+                check_record = None
+                if issue_record:
+                    check_record = db.query(TagCheckRecord).filter(
+                        TagCheckRecord.issue_record_id == issue_record.id
+                    ).first()
+                if not check_record:
+                    raise BusinessError(
+                        f"寄物牌 {tag.tag_code} 处于待核对状态，需先完成核对后才能闭环异常工单",
+                        conflict_object=f"异常工单#{ticket_id}",
+                        current_status=tag.status.value,
+                        code=409
+                    )
+
     ticket.handling_conclusion = handle_data.handling_conclusion
     ticket.handler = handle_data.handler
     ticket.handling_time = actual_handling_time
@@ -991,13 +1106,29 @@ def handle_exception_ticket(
 
             if not other_unclosed:
                 if ticket.exception_type == ExceptionType.MANUAL_MARK:
-                    if tag.status in [TagStatus.PENDING_CHECK, TagStatus.OVERTIME, TagStatus.AVAILABLE, TagStatus.PENDING_ISSUE]:
-                        tag.status = TagStatus.AVAILABLE
+                    if tag.status in [TagStatus.PENDING_CHECK, TagStatus.OVERTIME, TagStatus.AVAILABLE, TagStatus.PENDING_ISSUE, TagStatus.IN_USE]:
+                        if tag.status != TagStatus.IN_USE:
+                            tag.status = TagStatus.AVAILABLE
+                            tag.current_user = None
+                            tag.issue_time = None
+                            tag.expected_return_time = None
                         tag.updated_at = now
                 elif ticket.exception_type in [ExceptionType.OVERTIME, ExceptionType.PENDING_CHECK]:
                     if tag.status == TagStatus.OVERTIME:
                         tag.status = TagStatus.PENDING_CHECK
                         tag.updated_at = now
+                    elif tag.status == TagStatus.PENDING_CHECK:
+                        check_record = None
+                        if ticket.issue_record_id:
+                            check_record = db.query(TagCheckRecord).filter(
+                                TagCheckRecord.issue_record_id == ticket.issue_record_id
+                            ).first()
+                        if check_record and check_record.is_closed:
+                            tag.status = TagStatus.AVAILABLE
+                            tag.current_user = None
+                            tag.issue_time = None
+                            tag.expected_return_time = None
+                            tag.updated_at = now
 
     db.commit()
     db.refresh(ticket)
@@ -1124,6 +1255,8 @@ def get_exception_ticket_detail(db: Session, ticket_id: int) -> Optional[dict]:
 
 
 def get_exception_ticket_detailed_stats(db: Session) -> dict:
+    update_overtime_tags(db)
+
     total_count = db.query(TagExceptionTicket).count()
     pending_count = db.query(TagExceptionTicket).filter(
         TagExceptionTicket.ticket_status == TicketStatus.PENDING
@@ -1151,9 +1284,13 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
         TagExceptionTicket.area,
         func.count(TagExceptionTicket.id).label("total_count"),
         func.sum(case(
-            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 0),
-            else_=1
+            (TagExceptionTicket.ticket_status == TicketStatus.PENDING, 1),
+            else_=0
         )).label("pending_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.PROCESSING, 1),
+            else_=0
+        )).label("processing_count"),
         func.sum(case(
             (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 1),
             else_=0
@@ -1161,7 +1298,7 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
     ).group_by(TagExceptionTicket.area).all()
 
     by_area = []
-    for area, total, pending, closed in by_area_records:
+    for area, total, pending, processing, closed in by_area_records:
         closed_int = int(closed or 0)
         total_int = int(total or 0)
         rate = round(closed_int / total_int * 100, 2) if total_int > 0 else 0.0
@@ -1169,6 +1306,7 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
             "area": area,
             "total_count": total_int,
             "pending_count": int(pending or 0),
+            "processing_count": int(processing or 0),
             "closed_count": closed_int,
             "closure_rate": rate
         })
@@ -1178,9 +1316,13 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
         TagExceptionTicket.responsible_person,
         func.count(TagExceptionTicket.id).label("total_count"),
         func.sum(case(
-            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 0),
-            else_=1
+            (TagExceptionTicket.ticket_status == TicketStatus.PENDING, 1),
+            else_=0
         )).label("pending_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.PROCESSING, 1),
+            else_=0
+        )).label("processing_count"),
         func.sum(case(
             (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 1),
             else_=0
@@ -1188,7 +1330,7 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
     ).group_by(TagExceptionTicket.responsible_person).all()
 
     by_responsible = []
-    for person, total, pending, closed in by_responsible_records:
+    for person, total, pending, processing, closed in by_responsible_records:
         closed_int = int(closed or 0)
         total_int = int(total or 0)
         rate = round(closed_int / total_int * 100, 2) if total_int > 0 else 0.0
@@ -1196,6 +1338,7 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
             "responsible_person": person,
             "total_count": total_int,
             "pending_count": int(pending or 0),
+            "processing_count": int(processing or 0),
             "closed_count": closed_int,
             "closure_rate": rate
         })
@@ -1205,9 +1348,13 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
         TagExceptionTicket.exception_type,
         func.count(TagExceptionTicket.id).label("total_count"),
         func.sum(case(
-            (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 0),
-            else_=1
+            (TagExceptionTicket.ticket_status == TicketStatus.PENDING, 1),
+            else_=0
         )).label("pending_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status == TicketStatus.PROCESSING, 1),
+            else_=0
+        )).label("processing_count"),
         func.sum(case(
             (TagExceptionTicket.ticket_status == TicketStatus.CLOSED, 1),
             else_=0
@@ -1215,7 +1362,7 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
     ).group_by(TagExceptionTicket.exception_type).all()
 
     by_exception_type = []
-    for ex_type, total, pending, closed in by_type_records:
+    for ex_type, total, pending, processing, closed in by_type_records:
         closed_int = int(closed or 0)
         total_int = int(total or 0)
         rate = round(closed_int / total_int * 100, 2) if total_int > 0 else 0.0
@@ -1223,6 +1370,7 @@ def get_exception_ticket_detailed_stats(db: Session) -> dict:
             "exception_type": ex_type.value if isinstance(ex_type, ExceptionType) else str(ex_type),
             "total_count": total_int,
             "pending_count": int(pending or 0),
+            "processing_count": int(processing or 0),
             "closed_count": closed_int,
             "closure_rate": rate
         })
