@@ -267,12 +267,26 @@ class ExceptionProgressItem(BaseModel):
     timestamp: datetime
 
 
+class HandleRecordItem(BaseModel):
+    id: int
+    from_status: Optional[str] = None
+    to_status: str
+    handler: Optional[str] = None
+    handling_conclusion: Optional[str] = None
+    handling_time: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ExceptionTicketDetailResponse(BaseModel):
     ticket: ExceptionTicketResponse
     tag_status: TagStatusInfo
     latest_issue_record: Optional[ExceptionIssueRecordInfo] = None
     check_record: Optional[ExceptionCheckRecordInfo] = None
     processing_progress: List[ExceptionProgressItem]
+    handle_records: List[HandleRecordItem] = []
     current_responsible_person: str
     can_handle: bool
 

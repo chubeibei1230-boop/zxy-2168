@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, case
 from typing import List, Optional, Tuple
 
-from models import LuggageTag, TagIssueRecord, TagCheckRecord, TagStatus, TagExceptionTicket, ExceptionType, TicketStatus
+from models import LuggageTag, TagIssueRecord, TagCheckRecord, TagStatus, TagExceptionTicket, ExceptionType, TicketStatus, TicketHandleRecord
 from schemas import (
     TagCreate, TagUpdate, IssueTagRequest, ReturnTagRequest,
     CheckRecordCreate, ExceptionTicketCreate, ExceptionTicketHandle
@@ -35,6 +35,20 @@ def _check_issue_allowed(db: Session, tag: LuggageTag):
             code=409
         )
     if tag.status == TagStatus.DISABLED:
+        unclosed_manual = db.query(TagExceptionTicket).filter(
+            and_(
+                TagExceptionTicket.tag_id == tag.id,
+                TagExceptionTicket.exception_type == ExceptionType.MANUAL_MARK,
+                TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+            )
+        ).first()
+        if unclosed_manual:
+            raise BusinessError(
+                f"寄物牌 {tag.tag_code} 因人工标记异常已停用（工单号#{unclosed_manual.id}），需先闭环异常工单",
+                conflict_object=f"异常工单#{unclosed_manual.id}",
+                current_status=tag.status.value,
+                code=409
+            )
         raise BusinessError(
             f"寄物牌 {tag.tag_code} 已停用，无法发放",
             conflict_object=tag.tag_code,
@@ -454,7 +468,7 @@ def check_tag(db: Session, tag_code: str, check_data: CheckRecordCreate) -> Tupl
 
     if check_data.is_closed:
         tag.status = TagStatus.AVAILABLE
-        _close_related_tickets(
+        _update_related_tickets_to_processing(
             db, tag, latest_record,
             check_data.handling_conclusion, check_data.check_person
         )
@@ -783,7 +797,7 @@ def _auto_create_exception_ticket(
     return ticket
 
 
-def _close_related_tickets(
+def _update_related_tickets_to_processing(
     db: Session,
     tag: LuggageTag,
     issue_record: TagIssueRecord,
@@ -802,10 +816,14 @@ def _close_related_tickets(
         )
     ).all()
     for ticket in tickets:
-        ticket.ticket_status = TicketStatus.CLOSED
-        ticket.handling_conclusion = conclusion
-        ticket.handler = handler
-        ticket.handling_time = now
+        if ticket.ticket_status == TicketStatus.PENDING:
+            ticket.ticket_status = TicketStatus.PROCESSING
+        if not ticket.handler:
+            ticket.handler = handler
+        if not ticket.handling_conclusion:
+            ticket.handling_conclusion = conclusion
+        if not ticket.handling_time:
+            ticket.handling_time = now
         ticket.updated_at = now
 
 
@@ -881,6 +899,14 @@ def create_exception_ticket(
         ticket_status=TicketStatus.PENDING
     )
     db.add(ticket)
+
+    if ex_type == ExceptionType.MANUAL_MARK and tag.status in [TagStatus.AVAILABLE, TagStatus.PENDING_ISSUE]:
+        tag.status = TagStatus.DISABLED
+        tag.current_user = None
+        tag.issue_time = None
+        tag.expected_return_time = None
+        tag.updated_at = datetime.utcnow()
+
     db.commit()
     db.refresh(ticket)
     return ticket
@@ -1086,6 +1112,25 @@ def handle_exception_ticket(
                         current_status=tag.status.value,
                         code=409
                     )
+                if not check_record.is_closed:
+                    raise BusinessError(
+                        f"寄物牌 {tag.tag_code} 核对尚未闭环，需先完成核对闭环后才能闭环异常工单",
+                        conflict_object=f"异常工单#{ticket_id}",
+                        current_status="核对未闭环",
+                        code=409
+                    )
+
+    from_status = ticket.ticket_status.value if isinstance(ticket.ticket_status, TicketStatus) else str(ticket.ticket_status)
+
+    handle_record = TicketHandleRecord(
+        ticket_id=ticket.id,
+        from_status=from_status,
+        to_status=target_status.value if isinstance(target_status, TicketStatus) else str(target_status),
+        handler=handle_data.handler,
+        handling_conclusion=handle_data.handling_conclusion,
+        handling_time=actual_handling_time
+    )
+    db.add(handle_record)
 
     ticket.handling_conclusion = handle_data.handling_conclusion
     ticket.handler = handle_data.handler
@@ -1106,13 +1151,12 @@ def handle_exception_ticket(
 
             if not other_unclosed:
                 if ticket.exception_type == ExceptionType.MANUAL_MARK:
-                    if tag.status in [TagStatus.PENDING_CHECK, TagStatus.OVERTIME, TagStatus.AVAILABLE, TagStatus.PENDING_ISSUE, TagStatus.IN_USE]:
-                        if tag.status != TagStatus.IN_USE:
-                            tag.status = TagStatus.AVAILABLE
-                            tag.current_user = None
-                            tag.issue_time = None
-                            tag.expected_return_time = None
-                        tag.updated_at = now
+                    if tag.status in [TagStatus.DISABLED, TagStatus.PENDING_ISSUE, TagStatus.AVAILABLE]:
+                        tag.status = TagStatus.AVAILABLE
+                        tag.current_user = None
+                        tag.issue_time = None
+                        tag.expected_return_time = None
+                    tag.updated_at = now
                 elif ticket.exception_type in [ExceptionType.OVERTIME, ExceptionType.PENDING_CHECK]:
                     if tag.status == TagStatus.OVERTIME:
                         tag.status = TagStatus.PENDING_CHECK
@@ -1223,18 +1267,22 @@ def get_exception_ticket_detail(db: Session, ticket_id: int) -> Optional[dict]:
         "timestamp": ticket.created_at
     })
 
-    if ticket.ticket_status in [TicketStatus.PROCESSING, TicketStatus.CLOSED]:
+    handle_records_list = db.query(TicketHandleRecord).filter(
+        TicketHandleRecord.ticket_id == ticket.id
+    ).order_by(TicketHandleRecord.id.asc()).all()
+
+    for hr in handle_records_list:
         processing_progress.append({
-            "status": TicketStatus.PROCESSING.value,
-            "handler": ticket.handler,
-            "handling_conclusion": ticket.handling_conclusion,
-            "handling_time": ticket.handling_time,
-            "timestamp": ticket.handling_time if ticket.handling_time else ticket.updated_at
+            "status": hr.to_status,
+            "handler": hr.handler,
+            "handling_conclusion": hr.handling_conclusion,
+            "handling_time": hr.handling_time,
+            "timestamp": hr.handling_time if hr.handling_time else hr.created_at
         })
 
-    if ticket.ticket_status == TicketStatus.CLOSED:
+    if not handle_records_list and ticket.ticket_status in [TicketStatus.PROCESSING, TicketStatus.CLOSED]:
         processing_progress.append({
-            "status": TicketStatus.CLOSED.value,
+            "status": TicketStatus.PROCESSING.value,
             "handler": ticket.handler,
             "handling_conclusion": ticket.handling_conclusion,
             "handling_time": ticket.handling_time,
@@ -1249,6 +1297,7 @@ def get_exception_ticket_detail(db: Session, ticket_id: int) -> Optional[dict]:
         "latest_issue_record": latest_issue_record,
         "check_record": check_record,
         "processing_progress": processing_progress,
+        "handle_records": handle_records_list,
         "current_responsible_person": tag.responsible_person,
         "can_handle": can_handle
     }

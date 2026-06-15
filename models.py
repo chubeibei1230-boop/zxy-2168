@@ -111,3 +111,19 @@ class TagExceptionTicket(Base):
 
     tag = relationship("LuggageTag", back_populates="exception_tickets")
     issue_record = relationship("TagIssueRecord")
+    handle_records = relationship("TicketHandleRecord", back_populates="ticket", cascade="all, delete-orphan")
+
+
+class TicketHandleRecord(Base):
+    __tablename__ = "ticket_handle_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_id = Column(Integer, ForeignKey("tag_exception_tickets.id"), nullable=False, index=True)
+    from_status = Column(String(50), nullable=True)
+    to_status = Column(String(50), nullable=False)
+    handler = Column(String(100), nullable=True)
+    handling_conclusion = Column(Text, nullable=True)
+    handling_time = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    ticket = relationship("TagExceptionTicket", back_populates="handle_records")

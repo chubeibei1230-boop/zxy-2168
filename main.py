@@ -19,7 +19,8 @@ from schemas import (
     TagStatusInfo, ExceptionIssueRecordInfo, ExceptionCheckRecordInfo,
     ExceptionProgressItem, ExceptionTicketDetailedStats,
     ExceptionAreaStatsItem, ExceptionResponsibleStatsItem, ExceptionTypeStatsItem,
-    ExceptionLedgerItem, ExceptionLedgerListResponse
+    ExceptionLedgerItem, ExceptionLedgerListResponse,
+    HandleRecordItem
 )
 from crud import (
     BusinessError, create_tag, get_tag, get_tag_by_code, list_tags,
@@ -356,6 +357,9 @@ async def get_exception_ticket_full_detail(ticket_id: int, db: Session = Depends
         check_record=ExceptionCheckRecordInfo.model_validate(detail["check_record"]) if detail["check_record"] else None,
         processing_progress=[
             ExceptionProgressItem(**p) for p in detail["processing_progress"]
+        ],
+        handle_records=[
+            HandleRecordItem.model_validate(hr) for hr in detail["handle_records"]
         ],
         current_responsible_person=detail["current_responsible_person"],
         can_handle=detail["can_handle"]
