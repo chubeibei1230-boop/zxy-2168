@@ -3,10 +3,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, case
 from typing import List, Optional, Tuple
 
-from models import LuggageTag, TagIssueRecord, TagCheckRecord, TagStatus
+from models import LuggageTag, TagIssueRecord, TagCheckRecord, TagStatus, TagExceptionTicket, ExceptionType, TicketStatus
 from schemas import (
     TagCreate, TagUpdate, IssueTagRequest, ReturnTagRequest,
-    CheckRecordCreate
+    CheckRecordCreate, ExceptionTicketCreate, ExceptionTicketHandle
 )
 
 
@@ -19,7 +19,7 @@ class BusinessError(Exception):
         super().__init__(message)
 
 
-def _check_issue_allowed(tag: LuggageTag):
+def _check_issue_allowed(db: Session, tag: LuggageTag):
     if tag.status == TagStatus.IN_USE:
         raise BusinessError(
             f"寄物牌 {tag.tag_code} 正在使用中，无法再次发放",
@@ -46,6 +46,19 @@ def _check_issue_allowed(tag: LuggageTag):
             f"寄物牌 {tag.tag_code} 处于待核对状态，无法发放",
             conflict_object=tag.tag_code,
             current_status=tag.status.value,
+            code=409
+        )
+    unclosed_ticket = db.query(TagExceptionTicket).filter(
+        and_(
+            TagExceptionTicket.tag_id == tag.id,
+            TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+        )
+    ).first()
+    if unclosed_ticket:
+        raise BusinessError(
+            f"寄物牌 {tag.tag_code} 存在未闭环异常工单（工单号#{unclosed_ticket.id}），无法发放",
+            conflict_object=f"异常工单#{unclosed_ticket.id}",
+            current_status=unclosed_ticket.ticket_status.value,
             code=409
         )
 
@@ -284,10 +297,16 @@ def issue_tag(db: Session, request: IssueTagRequest) -> Tuple[LuggageTag, TagIss
         tag = get_tag_by_code(db, request.tag_code)
         if not tag:
             raise BusinessError(f"寄物牌 {request.tag_code} 不存在", code=404)
-        _check_issue_allowed(tag)
+        _check_issue_allowed(db, tag)
     else:
+        subquery = db.query(TagExceptionTicket.tag_id).filter(
+            TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+        ).distinct()
         query = db.query(LuggageTag).filter(
-            LuggageTag.status.in_([TagStatus.PENDING_ISSUE, TagStatus.AVAILABLE])
+            and_(
+                LuggageTag.status.in_([TagStatus.PENDING_ISSUE, TagStatus.AVAILABLE]),
+                LuggageTag.id.notin_(subquery)
+            )
         )
         if request.area:
             query = query.filter(LuggageTag.area == request.area)
@@ -376,6 +395,11 @@ def return_tag(db: Session, tag_code: str, request: ReturnTagRequest) -> Tuple[L
 
     if is_overtime:
         tag.status = TagStatus.PENDING_CHECK
+        _auto_create_exception_ticket(
+            db, tag, latest_record,
+            ExceptionType.OVERTIME,
+            f"寄物牌超时{overtime_hours}小时归还"
+        )
     else:
         tag.status = TagStatus.AVAILABLE
 
@@ -443,8 +467,24 @@ def check_tag(db: Session, tag_code: str, check_data: CheckRecordCreate) -> Tupl
 
     if check_data.is_closed:
         tag.status = TagStatus.AVAILABLE
+        _close_related_tickets(
+            db, tag, latest_record,
+            check_data.handling_conclusion, check_data.check_person
+        )
     else:
         tag.status = TagStatus.PENDING_CHECK
+        existing_ticket = db.query(TagExceptionTicket).filter(
+            and_(
+                TagExceptionTicket.issue_record_id == latest_record.id,
+                TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+            )
+        ).first()
+        if not existing_ticket:
+            _auto_create_exception_ticket(
+                db, tag, latest_record,
+                ExceptionType.PENDING_CHECK,
+                f"核对未闭环：{check_data.overtime_description}"
+            )
 
     tag.updated_at = datetime.utcnow()
 
@@ -722,3 +762,254 @@ def get_alerts(db: Session) -> List[dict]:
                 break
 
     return alerts
+
+
+def _auto_create_exception_ticket(
+    db: Session,
+    tag: LuggageTag,
+    issue_record: Optional[TagIssueRecord],
+    exception_type: ExceptionType,
+    description: str
+) -> TagExceptionTicket:
+    existing = db.query(TagExceptionTicket).filter(
+        and_(
+            TagExceptionTicket.tag_id == tag.id,
+            TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+        )
+    ).first()
+    if existing:
+        return existing
+
+    ticket = TagExceptionTicket(
+        tag_id=tag.id,
+        issue_record_id=issue_record.id if issue_record else None,
+        tag_code=tag.tag_code,
+        area=tag.area,
+        group_name=tag.group_name,
+        responsible_person=tag.responsible_person,
+        user_name=issue_record.user_name if issue_record else tag.current_user,
+        exception_type=exception_type,
+        exception_description=description,
+        ticket_status=TicketStatus.PENDING
+    )
+    db.add(ticket)
+    return ticket
+
+
+def _close_related_tickets(
+    db: Session,
+    tag: LuggageTag,
+    issue_record: TagIssueRecord,
+    conclusion: str,
+    handler: str
+):
+    now = datetime.utcnow()
+    tickets = db.query(TagExceptionTicket).filter(
+        and_(
+            TagExceptionTicket.tag_id == tag.id,
+            TagExceptionTicket.ticket_status != TicketStatus.CLOSED,
+            or_(
+                TagExceptionTicket.issue_record_id == issue_record.id,
+                TagExceptionTicket.issue_record_id.is_(None)
+            )
+        )
+    ).all()
+    for ticket in tickets:
+        ticket.ticket_status = TicketStatus.CLOSED
+        ticket.handling_conclusion = conclusion
+        ticket.handler = handler
+        ticket.handling_time = now
+        ticket.updated_at = now
+
+
+def create_exception_ticket(
+    db: Session,
+    ticket_data: ExceptionTicketCreate
+) -> TagExceptionTicket:
+    tag = get_tag_by_code(db, ticket_data.tag_code)
+    if not tag:
+        raise BusinessError(f"寄物牌 {ticket_data.tag_code} 不存在", code=404)
+
+    try:
+        ex_type = ExceptionType(ticket_data.exception_type)
+    except ValueError:
+        raise BusinessError(
+            f"无效的异常类型: {ticket_data.exception_type}",
+            conflict_object=ticket_data.exception_type,
+            code=400
+        )
+
+    latest_record = db.query(TagIssueRecord).filter(
+        TagIssueRecord.tag_id == tag.id
+    ).order_by(TagIssueRecord.id.desc()).first()
+
+    ticket = TagExceptionTicket(
+        tag_id=tag.id,
+        issue_record_id=latest_record.id if latest_record else None,
+        tag_code=tag.tag_code,
+        area=tag.area,
+        group_name=tag.group_name,
+        responsible_person=tag.responsible_person,
+        user_name=latest_record.user_name if latest_record else tag.current_user,
+        exception_type=ex_type,
+        exception_description=ticket_data.exception_description,
+        ticket_status=TicketStatus.PENDING
+    )
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+    return ticket
+
+
+def get_exception_ticket(db: Session, ticket_id: int) -> Optional[TagExceptionTicket]:
+    return db.query(TagExceptionTicket).filter(TagExceptionTicket.id == ticket_id).first()
+
+
+def list_exception_tickets(
+    db: Session,
+    tag_code: Optional[str] = None,
+    area: Optional[str] = None,
+    group_name: Optional[str] = None,
+    responsible_person: Optional[str] = None,
+    exception_type: Optional[str] = None,
+    ticket_status: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> Tuple[List[TagExceptionTicket], int]:
+    query = db.query(TagExceptionTicket)
+
+    if tag_code:
+        query = query.filter(TagExceptionTicket.tag_code == tag_code)
+    if area:
+        query = query.filter(TagExceptionTicket.area == area)
+    if group_name:
+        query = query.filter(TagExceptionTicket.group_name == group_name)
+    if responsible_person:
+        query = query.filter(TagExceptionTicket.responsible_person == responsible_person)
+    if exception_type:
+        try:
+            et = ExceptionType(exception_type)
+            query = query.filter(TagExceptionTicket.exception_type == et)
+        except ValueError:
+            pass
+    if ticket_status:
+        try:
+            ts = TicketStatus(ticket_status)
+            query = query.filter(TagExceptionTicket.ticket_status == ts)
+        except ValueError:
+            pass
+    if start_date:
+        query = query.filter(TagExceptionTicket.created_at >= start_date)
+    if end_date:
+        query = query.filter(TagExceptionTicket.created_at <= end_date)
+
+    total = query.count()
+    items = query.order_by(TagExceptionTicket.id.desc()).offset(skip).limit(limit).all()
+    return items, total
+
+
+def handle_exception_ticket(
+    db: Session,
+    ticket_id: int,
+    handle_data: ExceptionTicketHandle
+) -> TagExceptionTicket:
+    ticket = get_exception_ticket(db, ticket_id)
+    if not ticket:
+        raise BusinessError(f"异常工单 ID {ticket_id} 不存在", code=404)
+
+    if ticket.ticket_status == TicketStatus.CLOSED:
+        raise BusinessError(
+            f"异常工单 ID {ticket_id} 已闭环，不能重复处理",
+            conflict_object=f"异常工单#{ticket_id}",
+            current_status=ticket.ticket_status.value,
+            code=409
+        )
+
+    try:
+        target_status = TicketStatus(handle_data.ticket_status)
+    except ValueError:
+        raise BusinessError(
+            f"无效的处理状态: {handle_data.ticket_status}",
+            conflict_object=handle_data.ticket_status,
+            code=400
+        )
+
+    now = datetime.utcnow()
+    ticket.handling_conclusion = handle_data.handling_conclusion
+    ticket.handler = handle_data.handler
+    ticket.handling_time = now
+    ticket.ticket_status = target_status
+    ticket.updated_at = now
+
+    if target_status == TicketStatus.CLOSED:
+        tag = db.query(LuggageTag).filter(LuggageTag.id == ticket.tag_id).first()
+        if tag and tag.status == TagStatus.PENDING_CHECK:
+            other_unclosed = db.query(TagExceptionTicket).filter(
+                and_(
+                    TagExceptionTicket.tag_id == tag.id,
+                    TagExceptionTicket.id != ticket.id,
+                    TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+                )
+            ).first()
+            if not other_unclosed:
+                tag.status = TagStatus.AVAILABLE
+                tag.updated_at = now
+
+    db.commit()
+    db.refresh(ticket)
+    return ticket
+
+
+def get_exception_ticket_stats(db: Session) -> dict:
+    pending_count = db.query(TagExceptionTicket).filter(
+        TagExceptionTicket.ticket_status != TicketStatus.CLOSED
+    ).count()
+
+    closed_count = db.query(TagExceptionTicket).filter(
+        TagExceptionTicket.ticket_status == TicketStatus.CLOSED
+    ).count()
+
+    by_responsible_records = db.query(
+        TagExceptionTicket.responsible_person,
+        func.sum(case(
+            (TagExceptionTicket.ticket_status != TicketStatus.CLOSED, 1),
+            else_=0
+        )).label("unclosed_count"),
+        func.count(TagExceptionTicket.id).label("total_count")
+    ).group_by(TagExceptionTicket.responsible_person).all()
+
+    by_responsible = []
+    for person, unclosed, total in by_responsible_records:
+        by_responsible.append({
+            "responsible_person": person,
+            "unclosed_count": int(unclosed or 0),
+            "total_count": int(total or 0)
+        })
+    by_responsible.sort(key=lambda x: x["unclosed_count"], reverse=True)
+
+    by_area_records = db.query(
+        TagExceptionTicket.area,
+        func.count(TagExceptionTicket.id).label("exception_count"),
+        func.sum(case(
+            (TagExceptionTicket.ticket_status != TicketStatus.CLOSED, 1),
+            else_=0
+        )).label("unclosed_count")
+    ).group_by(TagExceptionTicket.area).all()
+
+    by_area = []
+    for area, exc_count, unclosed in by_area_records:
+        by_area.append({
+            "area": area,
+            "exception_count": int(exc_count or 0),
+            "unclosed_count": int(unclosed or 0)
+        })
+    by_area.sort(key=lambda x: x["exception_count"], reverse=True)
+
+    return {
+        "pending_count": pending_count,
+        "closed_count": closed_count,
+        "by_responsible": by_responsible,
+        "by_area": by_area
+    }

@@ -171,3 +171,58 @@ class ErrorResponse(BaseModel):
     message: str
     conflict_object: Optional[str] = None
     current_status: Optional[str] = None
+
+
+class ExceptionTicketCreate(BaseModel):
+    tag_code: str = Field(..., max_length=50, description="寄物牌编号")
+    exception_type: str = Field(..., description="异常类型：超时归还/待核对/人工标记异常")
+    exception_description: Optional[str] = Field(None, description="异常说明")
+
+
+class ExceptionTicketHandle(BaseModel):
+    handling_conclusion: str = Field(..., description="处理结论")
+    handler: str = Field(..., max_length=100, description="处理人")
+    ticket_status: Optional[str] = Field("已闭环", description="处理状态：待处理/处理中/已闭环")
+
+
+class ExceptionTicketResponse(BaseModel):
+    id: int
+    tag_id: int
+    issue_record_id: Optional[int] = None
+    tag_code: str
+    area: str
+    group_name: str
+    responsible_person: str
+    user_name: Optional[str] = None
+    exception_type: str
+    exception_description: Optional[str] = None
+    handling_conclusion: Optional[str] = None
+    handler: Optional[str] = None
+    handling_time: Optional[datetime] = None
+    ticket_status: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ExceptionTicketListResponse(BaseModel):
+    items: List[ExceptionTicketResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+class ExceptionTicketStats(BaseModel):
+    pending_count: int
+    closed_count: int
+    by_responsible: List[dict]
+    by_area: List[dict]
+
+
+class StatisticsResponse(BaseModel):
+    overtime_high_risk_areas: List[OvertimeAreaStats]
+    responsible_closure_rates: List[ResponsibleClosureStats]
+    pending_check_stats: PendingCheckStats
+    exception_ticket_stats: Optional[ExceptionTicketStats] = None

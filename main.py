@@ -6,20 +6,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from database import engine, Base, get_db
-from models import TagStatus
+from models import TagStatus, ExceptionType, TicketStatus
 from schemas import (
     TagCreate, TagUpdate, TagStatusUpdate, TagResponse, TagListResponse,
     IssueTagRequest, ReturnTagRequest, IssueRecordResponse, IssueRecordListResponse,
     CheckRecordCreate, CheckRecordResponse, CheckRecordListResponse,
     StatisticsResponse, OvertimeAreaStats, ResponsibleClosureStats, PendingCheckStats,
-    AlertResponse, AlertItem, ErrorResponse
+    AlertResponse, AlertItem, ErrorResponse,
+    ExceptionTicketCreate, ExceptionTicketHandle,
+    ExceptionTicketResponse, ExceptionTicketListResponse,
+    ExceptionTicketStats
 )
 from crud import (
     BusinessError, create_tag, get_tag, get_tag_by_code, list_tags,
     update_tag, update_tag_status, delete_tag, issue_tag, return_tag, check_tag,
     list_issue_records, list_check_records,
     get_overtime_high_risk_areas, get_responsible_closure_rates,
-    get_pending_check_stats, get_alerts, update_overtime_tags
+    get_pending_check_stats, get_alerts, update_overtime_tags,
+    create_exception_ticket, get_exception_ticket, list_exception_tickets,
+    handle_exception_ticket, get_exception_ticket_stats
 )
 
 Base.metadata.create_all(bind=engine)
@@ -256,6 +261,7 @@ async def get_statistics(db: Session = Depends(get_db)):
     overtime_areas = get_overtime_high_risk_areas(db)
     closure_rates = get_responsible_closure_rates(db)
     pending_stats = get_pending_check_stats(db)
+    ticket_stats = get_exception_ticket_stats(db)
 
     return StatisticsResponse(
         overtime_high_risk_areas=[
@@ -267,6 +273,12 @@ async def get_statistics(db: Session = Depends(get_db)):
         pending_check_stats=PendingCheckStats(
             pending_count=pending_stats["pending_count"],
             pending_tags=[TagResponse.model_validate(t) for t in pending_stats["pending_tags"]]
+        ),
+        exception_ticket_stats=ExceptionTicketStats(
+            pending_count=ticket_stats["pending_count"],
+            closed_count=ticket_stats["closed_count"],
+            by_responsible=ticket_stats["by_responsible"],
+            by_area=ticket_stats["by_area"]
         )
     )
 
@@ -280,6 +292,60 @@ async def get_all_alerts(db: Session = Depends(get_db)):
     )
 
 
+@app.post("/api/exception-tickets", response_model=ExceptionTicketResponse, tags=["异常工单"])
+async def create_new_exception_ticket(
+    ticket_data: ExceptionTicketCreate,
+    db: Session = Depends(get_db)
+):
+    return create_exception_ticket(db, ticket_data)
+
+
+@app.get("/api/exception-tickets", response_model=ExceptionTicketListResponse, tags=["异常工单"])
+async def get_exception_tickets(
+    tag_code: Optional[str] = Query(None, description="寄物牌编号"),
+    area: Optional[str] = Query(None, description="所属区域"),
+    group_name: Optional[str] = Query(None, description="分组"),
+    responsible_person: Optional[str] = Query(None, description="责任人"),
+    exception_type: Optional[str] = Query(None, description="异常类型"),
+    ticket_status: Optional[str] = Query(None, description="处理状态"),
+    start_date: Optional[datetime] = Query(None, description="开始日期"),
+    end_date: Optional[datetime] = Query(None, description="结束日期"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    db: Session = Depends(get_db)
+):
+    skip = (page - 1) * page_size
+    items, total = list_exception_tickets(
+        db, tag_code=tag_code, area=area, group_name=group_name,
+        responsible_person=responsible_person, exception_type=exception_type,
+        ticket_status=ticket_status, start_date=start_date, end_date=end_date,
+        skip=skip, limit=page_size
+    )
+    return ExceptionTicketListResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size
+    )
+
+
+@app.get("/api/exception-tickets/{ticket_id}", response_model=ExceptionTicketResponse, tags=["异常工单"])
+async def get_exception_ticket_detail(ticket_id: int, db: Session = Depends(get_db)):
+    ticket = get_exception_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail=f"异常工单 ID {ticket_id} 不存在")
+    return ticket
+
+
+@app.put("/api/exception-tickets/{ticket_id}/handle", response_model=ExceptionTicketResponse, tags=["异常工单"])
+async def handle_exception_ticket_by_id(
+    ticket_id: int,
+    handle_data: ExceptionTicketHandle,
+    db: Session = Depends(get_db)
+):
+    return handle_exception_ticket(db, ticket_id, handle_data)
+
+
 @app.get("/api/status-options", tags=["系统"])
 async def get_status_options():
     return {
@@ -288,6 +354,12 @@ async def get_status_options():
         "data": {
             "tag_statuses": [
                 {"value": s.value, "key": s.name} for s in TagStatus
+            ],
+            "exception_types": [
+                {"value": s.value, "key": s.name} for s in ExceptionType
+            ],
+            "ticket_statuses": [
+                {"value": s.value, "key": s.name} for s in TicketStatus
             ]
         }
     }

@@ -14,6 +14,18 @@ class TagStatus(str, enum.Enum):
     DISABLED = "停用"
 
 
+class ExceptionType(str, enum.Enum):
+    OVERTIME = "超时归还"
+    PENDING_CHECK = "待核对"
+    MANUAL_MARK = "人工标记异常"
+
+
+class TicketStatus(str, enum.Enum):
+    PENDING = "待处理"
+    PROCESSING = "处理中"
+    CLOSED = "已闭环"
+
+
 class LuggageTag(Base):
     __tablename__ = "luggage_tags"
 
@@ -32,6 +44,7 @@ class LuggageTag(Base):
 
     issue_records = relationship("TagIssueRecord", back_populates="tag", cascade="all, delete-orphan")
     check_records = relationship("TagCheckRecord", back_populates="tag", cascade="all, delete-orphan")
+    exception_tickets = relationship("TagExceptionTicket", back_populates="tag", cascade="all, delete-orphan")
 
 
 class TagIssueRecord(Base):
@@ -74,3 +87,27 @@ class TagCheckRecord(Base):
 
     tag = relationship("LuggageTag", back_populates="check_records")
     issue_record = relationship("TagIssueRecord", back_populates="check_record")
+
+
+class TagExceptionTicket(Base):
+    __tablename__ = "tag_exception_tickets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tag_id = Column(Integer, ForeignKey("luggage_tags.id"), nullable=False)
+    issue_record_id = Column(Integer, ForeignKey("tag_issue_records.id"), nullable=True)
+    tag_code = Column(String(50), index=True, nullable=False)
+    area = Column(String(100), index=True, nullable=False)
+    group_name = Column(String(100), index=True, nullable=False)
+    responsible_person = Column(String(100), index=True, nullable=False)
+    user_name = Column(String(100), nullable=True)
+    exception_type = Column(Enum(ExceptionType), index=True, nullable=False)
+    exception_description = Column(Text, nullable=True)
+    handling_conclusion = Column(Text, nullable=True)
+    handler = Column(String(100), nullable=True)
+    handling_time = Column(DateTime, nullable=True)
+    ticket_status = Column(Enum(TicketStatus), default=TicketStatus.PENDING, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    tag = relationship("LuggageTag", back_populates="exception_tickets")
+    issue_record = relationship("TagIssueRecord")
